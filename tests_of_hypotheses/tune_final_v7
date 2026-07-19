@@ -1,0 +1,292 @@
+"""Optuna tuning for the validated v7 feature space and final blend."""
+
+import json
+import warnings
+warnings.filterwarnings("ignore")
+
+import numpy as np
+import optuna
+import pandas as pd
+from catboost import CatBoostClassifier
+from lightgbm import LGBMClassifier
+import lightgbm as lgb
+from xgboost import XGBClassifier
+
+import solve
+from improvement_experiments import (
+    build_ctx_event_crosses,
+    build_price_affinity,
+    build_src_slot_features,
+    per_day_ap,
+)
+
+
+def build_data():
+    train, _, events = solve.load_data()
+    train = train.merge(solve.build_event_features(train, events), on="lead_id", how="left")
+    train = solve.build_tabular_features(train)
+    base_features = solve.select_features(solve.get_feature_columns(train))
+    cats = [c for c in solve.CATEGORICAL_FEATURES if c in base_features]
+    base_nums = [c for c in base_features if c not in cats]
+    added = []
+    for builder in [build_src_slot_features, build_ctx_event_crosses, build_price_affinity]:
+        group = builder(train, events)
+        train = train.merge(group, on="lead_id", how="left")
+        added.extend([c for c in group.columns if c != "lead_id"])
+    train[added] = train[added].replace([np.inf, -np.inf], np.nan)
+    return train, base_features, cats, base_nums, added
+
+
+def prepare_catboost(df, columns, cats):
+    result = df[columns].copy()
+    for col in cats:
+        result[col] = result[col].fillna("missing").astype(str)
+    return result
+
+
+def optimize_simplex(predictions, y, dates, steps=20):
+    best_score = -1.0
+    best_weights = None
+
+    def compositions(total, parts, prefix=()):
+        if parts == 1:
+            yield prefix + (total,)
+            return
+        for value in range(total + 1):
+            yield from compositions(total - value, parts - 1, prefix + (value,))
+
+    for composition in compositions(steps, predictions.shape[1]):
+        weights = np.asarray(composition, dtype=float) / steps
+        score = solve.daily_average_precision(y, predictions @ weights, dates)
+        if score > best_score:
+            best_score = score
+            best_weights = weights
+    return best_score, best_weights
+
+
+def main():
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+    train, base_features, cats, base_nums, added = build_data()
+    enhanced_features = base_features + added
+    enhanced_nums = base_nums + added
+    train_part, valid_part = solve.make_time_split(train, val_days=4)
+    y_tr = train_part[solve.TARGET].to_numpy()
+    y_vl = valid_part[solve.TARGET].to_numpy()
+    dates = pd.to_datetime(valid_part["assignment_date"]).dt.date.to_numpy()
+    pos = int(y_tr.sum())
+    scale = (len(y_tr) - pos) / pos
+
+    X_cb_tr = prepare_catboost(train_part, enhanced_features, cats)
+    X_cb_vl = prepare_catboost(valid_part, enhanced_features, cats)
+    X_lgb_base_tr = train_part[base_nums]
+    X_lgb_base_vl = valid_part[base_nums]
+    X_lgb_enh_tr = train_part[enhanced_nums]
+    X_lgb_enh_vl = valid_part[enhanced_nums]
+    X_xgb_tr = train_part[enhanced_nums]
+    X_xgb_vl = valid_part[enhanced_nums]
+
+    print("Training fixed LightGBM streams and current enhanced models...")
+    lgb_params = solve.LGBM_PARAMS.copy()
+    lgb_params["scale_pos_weight"] = scale
+    lgb_base = LGBMClassifier(**lgb_params)
+    lgb_base.fit(
+        X_lgb_base_tr, y_tr, eval_set=[(X_lgb_base_vl, y_vl)],
+        callbacks=[lgb.early_stopping(100, verbose=False), lgb.log_evaluation(0)],
+    )
+    lgb_base_pred = lgb_base.predict_proba(X_lgb_base_vl)[:, 1]
+    lgb_enh = LGBMClassifier(**lgb_params)
+    lgb_enh.fit(
+        X_lgb_enh_tr, y_tr, eval_set=[(X_lgb_enh_vl, y_vl)],
+        callbacks=[lgb.early_stopping(100, verbose=False), lgb.log_evaluation(0)],
+    )
+    lgb_enh_pred = lgb_enh.predict_proba(X_lgb_enh_vl)[:, 1]
+
+    current_cb_params = solve.CATBOOST_PARAMS.copy()
+    current_cb_params.update(cat_features=cats, verbose=0)
+    current_cb = CatBoostClassifier(**current_cb_params)
+    current_cb.fit(X_cb_tr, y_tr, eval_set=(X_cb_vl, y_vl), verbose=False)
+    current_cb_pred = current_cb.predict_proba(X_cb_vl)[:, 1]
+
+    current_xgb_params = solve.XGBOOST_PARAMS.copy()
+    current_xgb_params.update(scale_pos_weight=scale, early_stopping_rounds=100)
+    current_xgb = XGBClassifier(**current_xgb_params)
+    current_xgb.fit(X_xgb_tr, y_tr, eval_set=[(X_xgb_vl, y_vl)], verbose=False)
+    current_xgb_pred = current_xgb.predict_proba(X_xgb_vl)[:, 1]
+    current_score = solve.daily_average_precision(
+        y_vl, 0.4 * current_cb_pred + 0.3 * lgb_base_pred + 0.3 * current_xgb_pred, dates,
+    )
+    print(f"Current enhanced fixed blend: {current_score:.6f}")
+
+    print("\nTuning XGBoost (16 persistent trials)...")
+
+    def xgb_objective(trial):
+        params = {
+            "n_estimators": 2500,
+            "learning_rate": trial.suggest_float("learning_rate", 0.025, 0.085, log=True),
+            "max_depth": trial.suggest_int("max_depth", 2, 5),
+            "min_child_weight": trial.suggest_float("min_child_weight", 4.0, 30.0, log=True),
+            "reg_alpha": trial.suggest_float("reg_alpha", 0.005, 3.0, log=True),
+            "reg_lambda": trial.suggest_float("reg_lambda", 0.001, 5.0, log=True),
+            "subsample": trial.suggest_float("subsample", 0.72, 1.0),
+            "colsample_bytree": trial.suggest_float("colsample_bytree", 0.68, 1.0),
+            "gamma": trial.suggest_float("gamma", 0.0, 0.35),
+            "random_state": solve.RANDOM_STATE,
+            "verbosity": 0,
+            "n_jobs": -1,
+            "eval_metric": "logloss",
+            "scale_pos_weight": scale,
+            "early_stopping_rounds": 120,
+        }
+        model = XGBClassifier(**params)
+        model.fit(X_xgb_tr, y_tr, eval_set=[(X_xgb_vl, y_vl)], verbose=False)
+        pred = model.predict_proba(X_xgb_vl)[:, 1]
+        blend = 0.4 * current_cb_pred + 0.3 * lgb_base_pred + 0.3 * pred
+        score = solve.daily_average_precision(y_vl, blend, dates)
+        trial.set_user_attr("best_iteration", int(model.best_iteration + 1))
+        trial.set_user_attr("days", {k: float(v) for k, v in per_day_ap(y_vl, blend, dates).items()})
+        print(f"XGB trial {trial.number:02d}: {score:.6f} iter={model.best_iteration + 1}")
+        return score
+
+    xgb_study = optuna.create_study(
+        direction="maximize",
+        sampler=optuna.samplers.TPESampler(seed=42),
+        storage="sqlite:///tuning_xgb_v7.db",
+        study_name="xgb_v7",
+        load_if_exists=True,
+    )
+    xgb_study.enqueue_trial({
+        "learning_rate": solve.XGBOOST_PARAMS["learning_rate"],
+        "max_depth": solve.XGBOOST_PARAMS["max_depth"],
+        "min_child_weight": float(solve.XGBOOST_PARAMS["min_child_weight"]),
+        "reg_alpha": solve.XGBOOST_PARAMS["reg_alpha"],
+        "reg_lambda": solve.XGBOOST_PARAMS["reg_lambda"],
+        "subsample": solve.XGBOOST_PARAMS["subsample"],
+        "colsample_bytree": solve.XGBOOST_PARAMS["colsample_bytree"],
+        "gamma": solve.XGBOOST_PARAMS["gamma"],
+    })
+    xgb_study.optimize(xgb_objective, n_trials=16)
+    best_xgb_params = dict(xgb_study.best_params)
+    best_xgb_iterations = int(xgb_study.best_trial.user_attrs["best_iteration"])
+    best_xgb_full_params = {
+        **best_xgb_params,
+        "n_estimators": 2500,
+        "random_state": solve.RANDOM_STATE,
+        "verbosity": 0,
+        "n_jobs": -1,
+        "eval_metric": "logloss",
+        "scale_pos_weight": scale,
+        "early_stopping_rounds": 120,
+    }
+    best_xgb_model = XGBClassifier(**best_xgb_full_params)
+    best_xgb_model.fit(X_xgb_tr, y_tr, eval_set=[(X_xgb_vl, y_vl)], verbose=False)
+    best_xgb_pred = best_xgb_model.predict_proba(X_xgb_vl)[:, 1]
+    print(f"Best XGB: {xgb_study.best_value:.6f}, iter={best_xgb_iterations}, params={best_xgb_params}")
+
+    print("\nTuning CatBoost (8 persistent trials)...")
+
+    def cb_objective(trial):
+        params = {
+            "iterations": 1800,
+            "learning_rate": trial.suggest_float("learning_rate", 0.03, 0.11, log=True),
+            "depth": trial.suggest_int("depth", 3, 5),
+            "l2_leaf_reg": trial.suggest_float("l2_leaf_reg", 5.0, 60.0, log=True),
+            "min_data_in_leaf": trial.suggest_int("min_data_in_leaf", 15, 80),
+            "random_strength": trial.suggest_float("random_strength", 0.7, 7.0, log=True),
+            "bagging_temperature": trial.suggest_float("bagging_temperature", 0.0, 1.0),
+            "random_seed": solve.RANDOM_STATE,
+            "verbose": 0,
+            "eval_metric": "AUC",
+            "auto_class_weights": "Balanced",
+            "early_stopping_rounds": 120,
+            "cat_features": cats,
+        }
+        model = CatBoostClassifier(**params)
+        model.fit(X_cb_tr, y_tr, eval_set=(X_cb_vl, y_vl), verbose=False)
+        pred = model.predict_proba(X_cb_vl)[:, 1]
+        blend = 0.4 * pred + 0.3 * lgb_base_pred + 0.3 * best_xgb_pred
+        score = solve.daily_average_precision(y_vl, blend, dates)
+        trial.set_user_attr("best_iteration", int(model.tree_count_))
+        trial.set_user_attr("days", {k: float(v) for k, v in per_day_ap(y_vl, blend, dates).items()})
+        print(f"CB trial {trial.number:02d}: {score:.6f} iter={model.tree_count_}")
+        return score
+
+    cb_study = optuna.create_study(
+        direction="maximize",
+        sampler=optuna.samplers.TPESampler(seed=43),
+        storage="sqlite:///tuning_catboost_v7.db",
+        study_name="catboost_v7",
+        load_if_exists=True,
+    )
+    cb_study.enqueue_trial({
+        "learning_rate": solve.CATBOOST_PARAMS["learning_rate"],
+        "depth": solve.CATBOOST_PARAMS["depth"],
+        "l2_leaf_reg": solve.CATBOOST_PARAMS["l2_leaf_reg"],
+        "min_data_in_leaf": solve.CATBOOST_PARAMS["min_data_in_leaf"],
+        "random_strength": solve.CATBOOST_PARAMS["random_strength"],
+        "bagging_temperature": solve.CATBOOST_PARAMS["bagging_temperature"],
+    })
+    cb_study.optimize(cb_objective, n_trials=8)
+    best_cb_params = dict(cb_study.best_params)
+    best_cb_iterations = int(cb_study.best_trial.user_attrs["best_iteration"])
+    best_cb_full_params = {
+        **best_cb_params,
+        "iterations": 1800,
+        "random_seed": solve.RANDOM_STATE,
+        "verbose": 0,
+        "eval_metric": "AUC",
+        "auto_class_weights": "Balanced",
+        "early_stopping_rounds": 120,
+        "cat_features": cats,
+    }
+    best_cb_model = CatBoostClassifier(**best_cb_full_params)
+    best_cb_model.fit(X_cb_tr, y_tr, eval_set=(X_cb_vl, y_vl), verbose=False)
+    best_cb_pred = best_cb_model.predict_proba(X_cb_vl)[:, 1]
+    print(f"Best CB: {cb_study.best_value:.6f}, iter={best_cb_iterations}, params={best_cb_params}")
+
+    print("\nOptimizing final blend weights...")
+    matrix3 = np.column_stack([best_cb_pred, lgb_base_pred, best_xgb_pred])
+    score3, weights3 = optimize_simplex(matrix3, y_vl, dates, steps=40)
+    matrix4 = np.column_stack([best_cb_pred, lgb_base_pred, lgb_enh_pred, best_xgb_pred])
+    score4, weights4 = optimize_simplex(matrix4, y_vl, dates, steps=20)
+    if score4 > score3:
+        final_score, final_weights, final_matrix = score4, weights4, matrix4
+        model_order = ["catboost", "lgbm_base", "lgbm_enhanced", "xgboost"]
+    else:
+        final_score, final_weights, final_matrix = score3, weights3, matrix3
+        model_order = ["catboost", "lgbm_base", "xgboost"]
+    final_pred = final_matrix @ final_weights
+    final_days = {k: float(v) for k, v in per_day_ap(y_vl, final_pred, dates).items()}
+    print(f"3-model: {score3:.6f}, weights={weights3}")
+    print(f"4-model: {score4:.6f}, weights={weights4}")
+    print(f"FINAL: {final_score:.6f}, order={model_order}, weights={final_weights}, days={final_days}")
+
+    xgb_study.trials_dataframe().to_csv("tuning_xgb_trials.csv", index=False)
+    cb_study.trials_dataframe().to_csv("tuning_catboost_trials.csv", index=False)
+    result = {
+        "validation_score": float(final_score),
+        "validation_days": final_days,
+        "model_order": model_order,
+        "weights": [float(v) for v in final_weights],
+        "xgboost_params": best_xgb_params,
+        "xgboost_iterations": best_xgb_iterations,
+        "catboost_params": best_cb_params,
+        "catboost_iterations": best_cb_iterations,
+        "lgbm_base_best_iteration": int(lgb_base.best_iteration_),
+        "lgbm_enhanced_best_iteration": int(lgb_enh.best_iteration_),
+    }
+    with open("tuning_final_result.json", "w", encoding="utf-8") as file:
+        json.dump(result, file, ensure_ascii=False, indent=2)
+    np.savez_compressed(
+        "tuned_validation_predictions.npz",
+        y=y_vl,
+        dates=dates.astype(str),
+        catboost=best_cb_pred,
+        lgbm_base=lgb_base_pred,
+        lgbm_enhanced=lgb_enh_pred,
+        xgboost=best_xgb_pred,
+        final=final_pred,
+    )
+
+
+if __name__ == "__main__":
+    main()
